@@ -4,6 +4,8 @@ import logging
 import math
 import os
 import random
+import secrets
+import string
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +34,14 @@ CREATE TABLE IF NOT EXISTS matches (
  reporter_id INTEGER, winner TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
  finished_at TEXT);
 ''')
+# Lobby records are separate so existing matches and ratings remain untouched.
+conn.execute('''CREATE TABLE IF NOT EXISTS match_lobbies (
+ match_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
+ lobby_name TEXT NOT NULL, lobby_password TEXT NOT NULL,
+ host_id INTEGER NOT NULL, ready INTEGER NOT NULL DEFAULT 0,
+ settings TEXT NOT NULL DEFAULT 'Game mode: All Pick | Server: choose with players | Cheats: Off',
+ created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+
 
 @dataclass
 class Challenge:
@@ -83,7 +93,40 @@ def make_match(guild_id, mode, radiant, dire, rc, dc):
     cursor = conn.execute('''INSERT INTO matches
       (guild_id,mode,radiant,dire,radiant_captain,dire_captain)
       VALUES (?,?,?,?,?,?)''', (guild_id,mode,json.dumps(radiant),json.dumps(dire),rc,dc))
-    return cursor.lastrowid
+    match_id = cursor.lastrowid
+    ensure_lobby(guild_id, match_id, rc)
+    return match_id
+
+
+def ensure_lobby(guild_id, match_id, host_id):
+    existing = conn.execute('SELECT * FROM match_lobbies WHERE match_id=? AND guild_id=?',
+                            (match_id, guild_id)).fetchone()
+    if existing:
+        return existing
+    alphabet = string.ascii_uppercase + string.digits
+    password = ''.join(secrets.choice(alphabet) for _ in range(10))
+    conn.execute('''INSERT OR IGNORE INTO match_lobbies
+        (match_id,guild_id,lobby_name,lobby_password,host_id) VALUES (?,?,?,?,?)''',
+        (match_id, guild_id, f'Dotabot-{guild_id}-{match_id}', password, host_id))
+    return conn.execute('SELECT * FROM match_lobbies WHERE match_id=? AND guild_id=?',
+                        (match_id, guild_id)).fetchone()
+
+
+def lobby_details(guild_id, match):
+    import json
+    lobby = ensure_lobby(guild_id, match['match_id'], match['radiant_captain'])
+    radiant = json.loads(match['radiant'])
+    dire = json.loads(match['dire'])
+    state = 'READY' if lobby['ready'] else 'Waiting for host'
+    return (f'🎮 **Match #{match["match_id"]} — Dota 2 Lobby**\n'
+            f'**Status:** {state}\n'
+            f'**Lobby name:** `{lobby["lobby_name"]}`\n'
+            f'**Password:** `{lobby["lobby_password"]}`\n'
+            f'**Host:** <@{lobby["host_id"]}>\n'
+            f'**Settings:** {lobby["settings"]}\n\n'
+            f'**Radiant:** ' + ', '.join(f'<@{p}>' for p in radiant) + '\n'
+            f'**Dire:** ' + ', '.join(f'<@{p}>' for p in dire) + '\n\n'
+            'The host creates this lobby manually inside Dota 2, then uses `/lobby ready`.')
 
 
 def format_team(guild_id, members):
@@ -97,6 +140,7 @@ def match_announcement(guild_id, match_id, mode, radiant, dire):
             f'**Radiant ({r_total} total MMR)**\n{format_team(guild_id,radiant)}\n\n'
             f'**Dire ({d_total} total MMR)**\n{format_team(guild_id,dire)}\n\n'
             f'Captains: <@{radiant[0]}> and <@{dire[0]}>. '
+            'Use `/lobby show` for the lobby name, password and host. '
             'After playing, one captain uses `/report` and the other uses `/confirm`.')
 
 
@@ -440,5 +484,90 @@ async def resolve(interaction: discord.Interaction, match_id: int):
             conn.execute('UPDATE matches SET status=? WHERE match_id=?',('void',match_id))
             msg = f'Match #{match_id} voided without rating changes.'
         await interaction.response.send_message(msg,ephemeral=True)
+
+# Manual lobby hosting: match information persists across Railway restarts.
+lobby_group = app_commands.Group(name='lobby', description='Manual Dota 2 lobby hosting', guild_only=True)
+
+
+def find_lobby_match(gid, match_id, uid):
+    if match_id is not None:
+        return conn.execute('SELECT * FROM matches WHERE guild_id=? AND match_id=?',
+                            (gid, match_id)).fetchone()
+    import json
+    rows = conn.execute('''SELECT * FROM matches WHERE guild_id=?
+                           AND status IN ('pending','awaiting_confirmation')
+                           ORDER BY match_id DESC''', (gid,)).fetchall()
+    for row in rows:
+        if uid in json.loads(row['radiant']) or uid in json.loads(row['dire']):
+            return row
+    return None
+
+
+@lobby_group.command(name='show', description='Show lobby name, password, teams and host')
+async def lobby_show(interaction: discord.Interaction, match_id: int | None = None):
+    gid = interaction.guild_id
+    match = find_lobby_match(gid, match_id, interaction.user.id)
+    if not match:
+        await interaction.response.send_message(
+            'No matching active match found. Provide a match_id to look up an older match.', ephemeral=True)
+        return
+    await interaction.response.send_message(lobby_details(gid, match))
+
+
+@lobby_group.command(name='host', description='Captain or admin: assign a lobby host')
+async def lobby_host(interaction: discord.Interaction, match_id: int, player: discord.Member):
+    gid = interaction.guild_id
+    async with guild_lock(gid):
+        match = find_lobby_match(gid, match_id, interaction.user.id)
+        if not match:
+            msg = 'Match not found.'
+        elif match['status'] not in ('pending','awaiting_confirmation'):
+            msg = 'This match is no longer active.'
+        elif interaction.user.id not in (match['radiant_captain'], match['dire_captain']) and not interaction.user.guild_permissions.manage_guild:
+            msg = 'Only a captain or server manager can assign a host.'
+        elif player.bot:
+            msg = 'Choose a human lobby host.'
+        else:
+            ensure_lobby(gid, match_id, match['radiant_captain'])
+            conn.execute('UPDATE match_lobbies SET host_id=?,ready=0 WHERE guild_id=? AND match_id=?',
+                         (player.id, gid, match_id))
+            msg = f'Match #{match_id}: {player.mention} is now the lobby host. Use `/lobby show match_id:{match_id}` for details.'
+    await interaction.response.send_message(msg)
+
+
+@lobby_group.command(name='ready', description='Lobby host or admin: confirm lobby is created')
+async def lobby_ready(interaction: discord.Interaction, match_id: int):
+    gid = interaction.guild_id
+    async with guild_lock(gid):
+        match = find_lobby_match(gid, match_id, interaction.user.id)
+        if not match:
+            msg = 'Match not found.'
+        elif match['status'] not in ('pending','awaiting_confirmation'):
+            msg = 'This match is no longer active.'
+        else:
+            lobby = ensure_lobby(gid, match_id, match['radiant_captain'])
+            if interaction.user.id != lobby['host_id'] and not interaction.user.guild_permissions.manage_guild:
+                msg = 'Only the assigned host or a server manager can mark this lobby ready.'
+            else:
+                conn.execute('UPDATE match_lobbies SET ready=1 WHERE guild_id=? AND match_id=?',
+                             (gid, match_id))
+                msg = f'✅ Match #{match_id} lobby is ready! Players: use `/lobby show match_id:{match_id}` to join.'
+    await interaction.response.send_message(msg)
+
+
+@lobby_group.command(name='settings', description='Show the manual lobby settings for a match')
+async def lobby_settings(interaction: discord.Interaction, match_id: int):
+    gid = interaction.guild_id
+    match = find_lobby_match(gid, match_id, interaction.user.id)
+    if not match:
+        await interaction.response.send_message('Match not found.', ephemeral=True)
+        return
+    lobby = ensure_lobby(gid, match_id, match['radiant_captain'])
+    await interaction.response.send_message(
+        f'🎮 **Match #{match_id} lobby settings**\n{lobby["settings"]}\n'
+        'These are suggested settings; the host must configure them manually in Dota 2.')
+
+
+bot.tree.add_command(lobby_group)
 
 bot.run(TOKEN)
