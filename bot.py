@@ -156,12 +156,15 @@ class DraftView(discord.ui.View):
 
 class Dotabot(commands.Bot):
     async def setup_hook(self):
+        print("Starting slash command sync...", flush=True)
         synced = await self.tree.sync()
-        logging.info(
-            "Synchronized %s slash commands: %s",
-            len(synced),
-            [command.name for command in synced]
+        print(
+            f"SYNC COMPLETE: {len(synced)} commands: "
+            f"{[cmd.name for cmd in synced]}",
+            flush=True
         )
+
+
 
 
 
