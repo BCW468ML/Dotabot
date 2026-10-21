@@ -158,7 +158,7 @@ def approval_announcement(guild_id, match_id, mode, radiant, dire, rc, dc):
             f'**Dire** ({sum(mmr(guild_id,p) for p in dire)} total MMR)\n'
             f'{format_team(guild_id,dire)}\n\n'
             f'Captains <@{rc}> and <@{dc}>: each use '
-            f'`/match approve match_id:{match_id}` to authorize these teams.\n'
+            f'`/match approve {match_id}` to authorize these teams.\n'
             'Lobby details will be published automatically after both approvals. '
             'No result can be reported before approval.')
 
@@ -288,9 +288,9 @@ async def players(interaction: discord.Interaction):
     await interaction.response.send_message(f'**Ranked queue ({len(q)}/10)**\n{msg or "Empty"}')
 
 
-challenge_group = app_commands.Group(name='challenge',description='Challenge mode with captain drafting',guild_only=True)
 
-@challenge_group.command(name='start',description='Challenge another player to captain a match')
+@bot.tree.command(name='challenge',description='Challenge another player to captain a drafted match')
+@app_commands.guild_only()
 async def challenge_start(interaction: discord.Interaction, opponent: discord.Member):
     gid = interaction.guild_id
     async with guild_lock(gid):
@@ -304,10 +304,11 @@ async def challenge_start(interaction: discord.Interaction, opponent: discord.Me
             get_player(gid,interaction.user.id)
             get_player(gid,opponent.id)
             challenges[gid] = Challenge(interaction.user.id,opponent.id,interaction.channel_id)
-            msg = f'⚔️ {opponent.mention}, <@{interaction.user.id}> challenges you! Use `/challenge accept` or `/challenge decline`.'
+            msg = f'⚔️ {opponent.mention}, <@{interaction.user.id}> challenges you! Use `/accept` or `/decline`.'
         await interaction.response.send_message(msg)
 
-@challenge_group.command(name='accept',description='Accept a challenge against you')
+@bot.tree.command(name='accept',description='Accept your captain challenge')
+@app_commands.guild_only()
 async def challenge_accept(interaction: discord.Interaction):
     gid = interaction.guild_id
     async with guild_lock(gid):
@@ -316,10 +317,11 @@ async def challenge_accept(interaction: discord.Interaction):
             msg = 'You have no pending challenge to accept.'
         else:
             c.status = 'pool'
-            msg = 'Challenge accepted! Up to **25 volunteers** may use `/challenge join`. Captains use `/challenge draft` when at least 8 volunteers have joined.'
+            msg = 'Challenge accepted! Players use `/join` to volunteer. The captain draft starts automatically when 8 players have joined.'
         await interaction.response.send_message(msg)
 
-@challenge_group.command(name='decline',description='Decline a challenge against you')
+@bot.tree.command(name='decline',description='Decline your captain challenge')
+@app_commands.guild_only()
 async def challenge_decline(interaction: discord.Interaction):
     gid = interaction.guild_id
     async with guild_lock(gid):
@@ -331,7 +333,8 @@ async def challenge_decline(interaction: discord.Interaction):
             msg = 'Challenge declined.'
         await interaction.response.send_message(msg)
 
-@challenge_group.command(name='join',description='Join the challenge volunteer pool')
+@bot.tree.command(name='join',description='Join the active captain draft player pool')
+@app_commands.guild_only()
 async def challenge_join(interaction: discord.Interaction):
     gid = interaction.guild_id
     async with guild_lock(gid):
@@ -351,9 +354,19 @@ async def challenge_join(interaction: discord.Interaction):
             get_player(gid,uid)
             c.pool.append(uid)
             msg = f'{interaction.user.mention} joined the challenge pool ({len(c.pool)}/25).'
+            if len(c.pool) == 8:
+                c.status = 'draft'
+                c.radiant = [c.challenger]
+                c.dire = [c.challenged]
+                c.turn = 0
+                await interaction.response.send_message(
+                    f'⚔️ **Draft starting automatically!** <@{c.challenger}> picks first.\n'
+                    'Radiant: 1/5 | Dire: 1/5', view=DraftView(gid,c))
+                return
         await interaction.response.send_message(msg)
 
-@challenge_group.command(name='leave',description='Leave the challenge volunteer pool')
+@bot.tree.command(name='withdraw',description='Leave the challenge player pool before drafting')
+@app_commands.guild_only()
 async def challenge_leave(interaction: discord.Interaction):
     gid = interaction.guild_id
     async with guild_lock(gid):
@@ -365,7 +378,8 @@ async def challenge_leave(interaction: discord.Interaction):
             msg = f'You left the challenge pool ({len(c.pool)}/25).'
         await interaction.response.send_message(msg,ephemeral=True)
 
-@challenge_group.command(name='status',description='Show challenge status and volunteer pool')
+@bot.tree.command(name='challengestatus',description='Show challenge status and player pool')
+@app_commands.guild_only()
 async def challenge_status(interaction: discord.Interaction):
     c = challenges.get(interaction.guild_id)
     if not c:
@@ -376,29 +390,8 @@ async def challenge_status(interaction: discord.Interaction):
                + '\n'.join(f'<@{p}> — {mmr(interaction.guild_id,p)} MMR' for p in c.pool))
     await interaction.response.send_message(msg)
 
-@challenge_group.command(name='draft',description='Start captain drafting with at least 8 volunteers')
-async def challenge_draft(interaction: discord.Interaction):
-    gid = interaction.guild_id
-    async with guild_lock(gid):
-        c = challenges.get(gid)
-        if not c or c.status != 'pool':
-            await interaction.response.send_message('No open challenge pool.',ephemeral=True)
-            return
-        if interaction.user.id not in (c.challenger,c.challenged):
-            await interaction.response.send_message('Only captains can start the draft.',ephemeral=True)
-            return
-        if len(c.pool) < 8:
-            await interaction.response.send_message('At least 8 volunteers are needed.',ephemeral=True)
-            return
-        c.status = 'draft'
-        c.radiant = [c.challenger]
-        c.dire = [c.challenged]
-        c.turn = 0
-        await interaction.response.send_message(
-            f'**Challenge Draft** — Pick 1/8. <@{c.challenger}> is picking.\nRadiant: 1/5 | Dire: 1/5',
-            view=DraftView(gid,c))
-
-@challenge_group.command(name='cancel',description='Cancel a challenge (captains or Manage Server)')
+@bot.tree.command(name='cancelchallenge',description='Cancel a challenge (captains or Manage Server)')
+@app_commands.guild_only()
 async def challenge_cancel(interaction: discord.Interaction):
     gid = interaction.guild_id
     async with guild_lock(gid):
@@ -412,7 +405,6 @@ async def challenge_cancel(interaction: discord.Interaction):
             msg = 'Challenge canceled.'
         await interaction.response.send_message(msg)
 
-bot.tree.add_command(challenge_group)
 
 
 @bot.tree.command(name='profile',description='Show your inhouse rating and record')
@@ -533,7 +525,7 @@ async def match_approve(interaction: discord.Interaction, match_id: int):
                                             json.loads(match['radiant']),json.loads(match['dire'])))
             else:
                 waiting = match['dire_captain'] if side == 'radiant_approved' else match['radiant_captain']
-                msg = f'✅ Approval recorded for Match #{match_id}. Waiting for <@{waiting}> to use `/match approve match_id:{match_id}`.'
+                msg = f'✅ Approval recorded for Match #{match_id}. Waiting for <@{waiting}> to use `/match approve {match_id}`.'
     await interaction.response.send_message(msg)
 
 @match_group.command(name='status', description='Check which captains have approved a match')
@@ -603,7 +595,7 @@ async def lobby_host(interaction: discord.Interaction, match_id: int, player: di
             ensure_lobby(gid, match_id, match['radiant_captain'])
             conn.execute('UPDATE match_lobbies SET host_id=?,ready=0 WHERE guild_id=? AND match_id=?',
                          (player.id, gid, match_id))
-            msg = f'Match #{match_id}: {player.mention} is now the lobby host. Use `/lobby show match_id:{match_id}` for details.'
+            msg = f'Match #{match_id}: {player.mention} is now the lobby host. Use `/lobby show {match_id}` for details.'
     await interaction.response.send_message(msg)
 
 
@@ -623,7 +615,7 @@ async def lobby_ready(interaction: discord.Interaction, match_id: int):
             else:
                 conn.execute('UPDATE match_lobbies SET ready=1 WHERE guild_id=? AND match_id=?',
                              (gid, match_id))
-                msg = f'✅ Match #{match_id} lobby is ready! Players: use `/lobby show match_id:{match_id}` to join.'
+                msg = f'✅ Match #{match_id} lobby is ready! Players: use `/lobby show {match_id}` to join.'
     await interaction.response.send_message(msg)
 
 
