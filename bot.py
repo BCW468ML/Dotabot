@@ -154,7 +154,6 @@ class DraftView(discord.ui.View):
         self.add_item(DraftSelect(guild_id,challenge))
 
 
-
 class Dotabot(commands.Bot):
     async def setup_hook(self):
         synced = await self.tree.sync()
@@ -163,6 +162,7 @@ class Dotabot(commands.Bot):
             len(synced),
             [command.name for command in synced]
         )
+
 
 
 bot = Dotabot(command_prefix='!', intents=discord.Intents.default())
