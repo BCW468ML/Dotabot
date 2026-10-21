@@ -39,8 +39,12 @@ conn.execute('''CREATE TABLE IF NOT EXISTS match_lobbies (
  match_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
  lobby_name TEXT NOT NULL, lobby_password TEXT NOT NULL,
  host_id INTEGER NOT NULL, ready INTEGER NOT NULL DEFAULT 0,
- settings TEXT NOT NULL DEFAULT 'Game mode: All Pick | Server: choose with players | Cheats: Off',
+ settings TEXT NOT NULL DEFAULT 'Game mode: All Pick | Cheats: Off | Lobby visibility: Private/password protected | Server region: agree with players | Teams: use assigned Radiant/Dire rosters | Fill empty slots with bots: Off',
  created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+conn.execute('''CREATE TABLE IF NOT EXISTS match_approvals (
+  match_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL,
+  radiant_approved INTEGER NOT NULL DEFAULT 0,
+  dire_approved INTEGER NOT NULL DEFAULT 0)''')
 
 
 @dataclass
@@ -91,10 +95,10 @@ def balance(guild_id, players):
 def make_match(guild_id, mode, radiant, dire, rc, dc):
     import json
     cursor = conn.execute('''INSERT INTO matches
-      (guild_id,mode,radiant,dire,radiant_captain,dire_captain)
-      VALUES (?,?,?,?,?,?)''', (guild_id,mode,json.dumps(radiant),json.dumps(dire),rc,dc))
+      (guild_id,mode,radiant,dire,radiant_captain,dire_captain,status)
+      VALUES (?,?,?,?,?,?,?)''', (guild_id,mode,json.dumps(radiant),json.dumps(dire),rc,dc,'awaiting_captains'))
     match_id = cursor.lastrowid
-    ensure_lobby(guild_id, match_id, rc)
+    conn.execute('INSERT INTO match_approvals(match_id,guild_id) VALUES (?,?)', (match_id,guild_id))
     return match_id
 
 
@@ -105,9 +109,12 @@ def ensure_lobby(guild_id, match_id, host_id):
         return existing
     alphabet = string.ascii_uppercase + string.digits
     password = ''.join(secrets.choice(alphabet) for _ in range(10))
+    settings = ('Game mode: All Pick | Cheats: Off | Lobby visibility: Private/password protected | '
+                'Server region: agree with players | Teams: use assigned Radiant/Dire rosters | '
+                'Fill empty slots with bots: Off')
     conn.execute('''INSERT OR IGNORE INTO match_lobbies
-        (match_id,guild_id,lobby_name,lobby_password,host_id) VALUES (?,?,?,?,?)''',
-        (match_id, guild_id, f'Dotabot-{guild_id}-{match_id}', password, host_id))
+        (match_id,guild_id,lobby_name,lobby_password,host_id,settings) VALUES (?,?,?,?,?,?)''',
+        (match_id, guild_id, f'Dotabot-{guild_id}-{match_id}', password, host_id, settings))
     return conn.execute('SELECT * FROM match_lobbies WHERE match_id=? AND guild_id=?',
                         (match_id, guild_id)).fetchone()
 
@@ -140,9 +147,20 @@ def match_announcement(guild_id, match_id, mode, radiant, dire):
             f'**Radiant ({r_total} total MMR)**\n{format_team(guild_id,radiant)}\n\n'
             f'**Dire ({d_total} total MMR)**\n{format_team(guild_id,dire)}\n\n'
             f'Captains: <@{radiant[0]}> and <@{dire[0]}>. '
-            'Use `/lobby show` for the lobby name, password and host. '
-            'After playing, one captain uses `/report` and the other uses `/confirm`.')
+            'After playing, one captain uses `/report` and the other uses `/confirm`.\n\n'
+            + lobby_details(guild_id, conn.execute('SELECT * FROM matches WHERE guild_id=? AND match_id=?', (guild_id,match_id)).fetchone()))
 
+
+def approval_announcement(guild_id, match_id, mode, radiant, dire, rc, dc):
+    return (f'⚔️ **Match #{match_id} — {mode.title()} | Awaiting captain approval**\n'
+            f'**Radiant** ({sum(mmr(guild_id,p) for p in radiant)} total MMR)\n'
+            f'{format_team(guild_id,radiant)}\n\n'
+            f'**Dire** ({sum(mmr(guild_id,p) for p in dire)} total MMR)\n'
+            f'{format_team(guild_id,dire)}\n\n'
+            f'Captains <@{rc}> and <@{dc}>: each use '
+            f'`/match approve match_id:{match_id}` to authorize these teams.\n'
+            'Lobby details will be published automatically after both approvals. '
+            'No result can be reported before approval.')
 
 def player_busy(guild_id, user_id):
     c = challenges.get(guild_id)
@@ -182,7 +200,7 @@ class DraftSelect(discord.ui.Select):
                 match_id = make_match(gid,'challenge',c.radiant,c.dire,c.challenger,c.challenged)
                 c.status = 'complete'
                 await interaction.message.edit(content='Draft complete!', view=None)
-                await interaction.followup.send(match_announcement(gid,match_id,'challenge',c.radiant,c.dire))
+                await interaction.followup.send(approval_announcement(gid,match_id,'challenge',c.radiant,c.dire,c.challenger,c.challenged))
                 challenges.pop(gid,None)
             else:
                 next_captain = c.challenger if c.turn % 2 == 0 else c.challenged
@@ -246,7 +264,7 @@ async def queue(interaction: discord.Interaction):
             q.clear()
             radiant,dire = balance(gid,players)
             match_id = make_match(gid,'ranked',radiant,dire,radiant[0],dire[0])
-            await interaction.followup.send(match_announcement(gid,match_id,'ranked',radiant,dire))
+            await interaction.followup.send(approval_announcement(gid,match_id,'ranked',radiant,dire,radiant[0],dire[0]))
 
 
 @bot.tree.command(name='leave',description='Leave the ranked inhouse queue')
@@ -485,6 +503,57 @@ async def resolve(interaction: discord.Interaction, match_id: int):
             msg = f'Match #{match_id} voided without rating changes.'
         await interaction.response.send_message(msg,ephemeral=True)
 
+# Captain authorization is separate from /confirm (which confirms game results).
+match_group = app_commands.Group(name='match', description='Approve drafted or balanced teams', guild_only=True)
+
+@match_group.command(name='approve', description='Captain: authorize your team before lobby publication')
+async def match_approve(interaction: discord.Interaction, match_id: int):
+    gid = interaction.guild_id
+    async with guild_lock(gid):
+        match = conn.execute('SELECT * FROM matches WHERE guild_id=? AND match_id=?',
+                             (gid,match_id)).fetchone()
+        if not match:
+            msg = 'Match not found.'
+        elif match['status'] != 'awaiting_captains':
+            msg = 'This match is not awaiting captain approval.'
+        elif interaction.user.id not in (match['radiant_captain'],match['dire_captain']):
+            msg = 'Only the two captains can approve their teams.'
+        else:
+            side = 'radiant_approved' if interaction.user.id == match['radiant_captain'] else 'dire_approved'
+            conn.execute(f'UPDATE match_approvals SET {side}=1 WHERE guild_id=? AND match_id=?', (gid,match_id))
+            approval = conn.execute('SELECT * FROM match_approvals WHERE guild_id=? AND match_id=?',
+                                    (gid,match_id)).fetchone()
+            if approval['radiant_approved'] and approval['dire_approved']:
+                conn.execute('UPDATE matches SET status=? WHERE guild_id=? AND match_id=?',
+                             ('pending',gid,match_id))
+                ensure_lobby(gid,match_id,match['radiant_captain'])
+                import json
+                msg = ('✅ **Both captains approved. Teams are locked!**\n\n'
+                       + match_announcement(gid,match_id,match['mode'],
+                                            json.loads(match['radiant']),json.loads(match['dire'])))
+            else:
+                waiting = match['dire_captain'] if side == 'radiant_approved' else match['radiant_captain']
+                msg = f'✅ Approval recorded for Match #{match_id}. Waiting for <@{waiting}> to use `/match approve match_id:{match_id}`.'
+    await interaction.response.send_message(msg)
+
+@match_group.command(name='status', description='Check which captains have approved a match')
+async def match_status(interaction: discord.Interaction, match_id: int):
+    gid = interaction.guild_id
+    match = conn.execute('SELECT * FROM matches WHERE guild_id=? AND match_id=?', (gid,match_id)).fetchone()
+    if not match:
+        await interaction.response.send_message('Match not found.', ephemeral=True)
+        return
+    approval = conn.execute('SELECT * FROM match_approvals WHERE guild_id=? AND match_id=?', (gid,match_id)).fetchone()
+    if approval:
+        msg = (f'Match #{match_id} — {match["status"]}\n'
+               f'Radiant <@{match["radiant_captain"]}>: {"✅" if approval["radiant_approved"] else "⏳"}\n'
+               f'Dire <@{match["dire_captain"]}>: {"✅" if approval["dire_approved"] else "⏳"}')
+    else:
+        msg = f'Match #{match_id} — {match["status"]} (created before captain approvals were introduced).'
+    await interaction.response.send_message(msg)
+
+bot.tree.add_command(match_group)
+
 # Manual lobby hosting: match information persists across Railway restarts.
 lobby_group = app_commands.Group(name='lobby', description='Manual Dota 2 lobby hosting', guild_only=True)
 
@@ -510,6 +579,9 @@ async def lobby_show(interaction: discord.Interaction, match_id: int | None = No
     if not match:
         await interaction.response.send_message(
             'No matching active match found. Provide a match_id to look up an older match.', ephemeral=True)
+        return
+    if match['status'] == 'awaiting_captains':
+        await interaction.response.send_message('Both captains must approve first using `/match approve`.', ephemeral=True)
         return
     await interaction.response.send_message(lobby_details(gid, match))
 
@@ -561,6 +633,9 @@ async def lobby_settings(interaction: discord.Interaction, match_id: int):
     match = find_lobby_match(gid, match_id, interaction.user.id)
     if not match:
         await interaction.response.send_message('Match not found.', ephemeral=True)
+        return
+    if match['status'] == 'awaiting_captains':
+        await interaction.response.send_message('Both captains must approve first using `/match approve`.', ephemeral=True)
         return
     lobby = ensure_lobby(gid, match_id, match['radiant_captain'])
     await interaction.response.send_message(
